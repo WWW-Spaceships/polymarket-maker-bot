@@ -1,0 +1,73 @@
+# Polymarket Maker Bot — Default Configuration
+# Secrets (PRIVATE_KEY, DATABASE_URL, etc.) should be in .env or environment variables.
+
+[auth]
+# signature_type: 1 = EOA, 2 = Gnosis Safe
+signature_type = 1
+
+[clob]
+base_url = "https://clob.polymarket.com"
+gamma_base_url = "https://gamma-api.polymarket.com"
+ws_market_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+ws_user_url = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+chain_id = 137
+
+[trading]
+enabled = false      # Start in paper mode — set to true for live
+paper_mode = true    # Log orders without sending to CLOB
+
+[strategy]
+min_half_spread = 0.01         # Minimum half-spread (1 cent)
+volatility_coefficient = 0.5   # Spread scales with oracle vol
+inventory_skew_factor = 0.02   # Price skew per unit net imbalance
+cancel_threshold_bps = 2.0     # Cancel/replace if oracle moves > 2bps
+default_order_size = 10.0      # Default order size in shares
+quote_size = 20.0              # Size per quote leg
+
+[risk]
+max_yes_position = 100.0       # Max YES shares per market
+max_no_position = 100.0        # Max NO shares per market
+max_total_exposure_usd = 500.0 # Portfolio-wide USD exposure cap
+max_concurrent_markets = 8     # Max markets to quote simultaneously
+max_daily_loss_usd = 50.0      # Circuit breaker: halt if daily loss exceeds
+max_order_size = 50.0          # Max shares per single order
+min_order_size = 5.0           # Polymarket minimum
+max_inventory_imbalance = 80.0 # Max |YES - NO| shares per market
+
+[article]
+enabled = true
+min_bn_delta_60s_bps = 15.0    # Min Binance 60s delta to fire
+min_cb_delta_60s_bps = 10.0    # Min Coinbase 60s delta to fire
+min_trending_mid = 0.75        # PM mid must confirm direction
+article_size = 20.0            # Article strategy order size
+entry_price_cap = 0.95         # Max entry price (cap at 95c)
+trigger_seconds_before_close = 10.0
+min_seconds_before_close = 2.0
+
+[feeds]
+binance_ws_url = "wss://stream.binance.com:9443/ws"
+coinbase_ws_url = "wss://ws-feed.exchange.coinbase.com"
+polymarket_ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+oracle_stale_max_ms = 2000.0   # Feed considered stale after 2s
+book_stale_max_ms = 3000.0     # Book considered stale after 3s
+
+[discovery]
+poll_interval_ms = 1500        # Poll Gamma API every 1.5s
+allowed_assets = ["btc", "eth"]
+allowed_timeframes = ["5min", "15min"]
+max_tracked_markets = 50
+
+[database]
+# url set via DATABASE_URL env var
+
+[telegram]
+# bot_token set via TELEGRAM_BOT_TOKEN env var
+# chat_id set via TELEGRAM_CHAT_ID env var
+
+[web]
+enabled = true
+port = 8080
+
+[logging]
+log_level = "info"
+json_output = false

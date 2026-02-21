@@ -1,0 +1,73 @@
+[package]
+name = "polymarket-maker-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# --- Async runtime ---
+tokio = { version = "1", features = ["full"] }
+
+# --- WebSocket (Binance/Coinbase feeds) ---
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+# --- HTTP client (Gamma API, CLOB REST) ---
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+
+# --- Database ---
+sqlx = { version = "0.8", features = [
+    "runtime-tokio", "tls-native-tls", "postgres",
+    "chrono", "migrate"
+] }
+
+# --- Serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# --- Cryptography (EIP-712 signing) ---
+# We only use alloy for sol-types and signer — keep features minimal
+alloy = { version = "1", features = [
+    "signers", "signer-local", "sol-types",
+] }
+
+# --- Time ---
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- Logging ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# --- Web framework (dashboard) ---
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# --- Configuration ---
+config = "0.14"
+dotenvy = "0.15"
+
+# --- Error handling ---
+thiserror = "2"
+anyhow = "1"
+
+# --- HMAC signing (CLOB auth) ---
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+# --- Misc ---
+uuid = { version = "1", features = ["v4"] }
+dashmap = "6"
+parking_lot = "0.12"
+rand = "0.8"
+url = "2"
+hex = "0.4"
+
+[dev-dependencies]
+tokio-test = "0.4"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "hot_loop"
+harness = false
+path = "tests/benches/hot_loop.rs"
