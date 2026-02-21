@@ -1,10 +1,16 @@
 # --- Build stage ---
-FROM rust:1.85-bookworm AS builder
+FROM debian:bookworm AS builder
 
 WORKDIR /app
 
-# Install native TLS deps
-RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+# Install build deps + rustup
+RUN apt-get update && apt-get install -y \
+    curl build-essential pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust 1.93 via rustup (Docker Hub rust images lag behind)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Cache dependency build — copy manifests first
 COPY Cargo.toml Cargo.lock ./
