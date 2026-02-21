@@ -53,8 +53,14 @@ impl WebServer {
             .merge(routes::api_routes())
             .with_state(self.state);
 
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], self.config.port));
-        info!(port = self.config.port, "web dashboard starting");
+        // Railway injects PORT env var — prefer it over config
+        let port = std::env::var("PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(self.config.port);
+
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        info!(port, "web dashboard starting");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
