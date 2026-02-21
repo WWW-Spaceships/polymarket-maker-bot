@@ -2,6 +2,7 @@
 //!
 //! Loads configuration, initializes all subsystems, and runs the main event loop.
 //! Handles graceful shutdown on SIGINT/SIGTERM.
+//! Health endpoint starts immediately so Railway doesn't restart-loop.
 
 mod config;
 mod db;
@@ -26,12 +27,28 @@ use crate::db::pool;
 use crate::events::bus::EventBus;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
     // Load .env file (ignore if missing)
     let _ = dotenvy::dotenv();
 
+    // Start health endpoint FIRST so Railway health check passes while we init
+    let health_port = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8080);
+
+    tokio::spawn(run_health_server(health_port));
+
     // Load configuration
-    let config = Config::load()?;
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("FATAL: config load failed: {e}");
+            // Keep health server alive so Railway logs are visible
+            wait_for_shutdown().await;
+            return;
+        }
+    };
 
     // Initialize logging
     logging::structured::init_logging(&config.logging);
@@ -43,10 +60,24 @@ async fn main() -> anyhow::Result<()> {
         "polymarket-maker-bot starting"
     );
 
-    // Initialize database
-    let db_pool = pool::create_pool(&config.database.url).await?;
-    pool::run_migrations(&db_pool).await?;
-    info!("database connected and migrations applied");
+    // Initialize database (retry a few times — Railway PG may still be booting)
+    let db_pool = match connect_db_with_retry(&config.database.url, 5).await {
+        Some(p) => p,
+        None => {
+            error!("database connection failed after retries — check DATABASE_URL");
+            wait_for_shutdown().await;
+            return;
+        }
+    };
+
+    match pool::run_migrations(&db_pool).await {
+        Ok(_) => info!("database migrations applied"),
+        Err(e) => {
+            error!(error = %e, "database migrations failed");
+            wait_for_shutdown().await;
+            return;
+        }
+    }
 
     // Initialize event bus
     let event_bus = Arc::new(EventBus::new(1024));
@@ -66,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize pricing model
     let pricer = Arc::new(strategy::pricing::QuotePricer::new(
         config.strategy.clone(),
-        None, // bayesian weights loaded from DB later
+        None,
     ));
 
     // Initialize article strategy
@@ -97,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn feed tasks
     let feed_hub_clone = feed_hub.clone();
-    let _feed_handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         feed_hub_clone.start().await;
     });
 
@@ -110,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
     let pos_disc = position_tracker.clone();
     let db_disc = db_pool.clone();
     let config_disc = config.clone();
-    let _discovery_handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         discovery::gamma::run_discovery_loop(
             discovery_clone,
             feed_hub_for_disc,
@@ -125,22 +156,21 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Spawn Telegram bot (if configured)
-    let _telegram_handle = if config.telegram.bot_token.is_some() {
+    if config.telegram.bot_token.is_some() {
         let tg = telegram::bot::TelegramBot::new(
             config.telegram.clone(),
             event_bus.subscribe(),
         );
-        Some(tokio::spawn(async move {
+        tokio::spawn(async move {
             if let Err(e) = tg.run().await {
                 error!(error = %e, "telegram bot error");
             }
-        }))
-    } else {
-        None
-    };
+        });
+    }
 
-    // Spawn web dashboard (if enabled)
-    let _web_handle = if config.web.enabled {
+    // Spawn full web dashboard (on a different port won't conflict with health server)
+    // The health server on PORT handles Railway, dashboard runs alongside
+    if config.web.enabled {
         let web_server = web::server::WebServer::new(
             config.web.clone(),
             db_pool.clone(),
@@ -148,31 +178,17 @@ async fn main() -> anyhow::Result<()> {
             order_manager.clone(),
             feed_hub.clone(),
         );
-        Some(tokio::spawn(async move {
+        tokio::spawn(async move {
             if let Err(e) = web_server.start().await {
                 error!(error = %e, "web server error");
             }
-        }))
-    } else {
-        None
-    };
+        });
+    }
 
     info!("all subsystems started, waiting for shutdown signal");
 
     // Wait for shutdown signal
-    let shutdown = async {
-        let ctrl_c = signal::ctrl_c();
-        #[cfg(unix)]
-        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler");
-
-        tokio::select! {
-            _ = ctrl_c => { info!("received SIGINT"); }
-            _ = sigterm.recv() => { info!("received SIGTERM"); }
-        }
-    };
-
-    shutdown.await;
+    wait_for_shutdown().await;
 
     // Graceful shutdown
     warn!("shutting down — cancelling all orders");
@@ -181,5 +197,49 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("shutdown complete");
-    Ok(())
+}
+
+/// Minimal /health server — starts instantly for Railway health checks.
+async fn run_health_server(port: u16) {
+    use axum::{routing::get, Router};
+
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }));
+
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    eprintln!("health server listening on port {port}");
+
+    if let Ok(listener) = tokio::net::TcpListener::bind(addr).await {
+        let _ = axum::serve(listener, app).await;
+    }
+}
+
+/// Try connecting to Postgres with retries (Railway PG may take a moment).
+async fn connect_db_with_retry(url: &str, max_attempts: u32) -> Option<sqlx::PgPool> {
+    for attempt in 1..=max_attempts {
+        match pool::create_pool(url).await {
+            Ok(p) => {
+                info!(attempt, "database connected");
+                return Some(p);
+            }
+            Err(e) => {
+                warn!(attempt, max_attempts, error = %e, "database connection failed, retrying...");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
+    None
+}
+
+/// Wait for SIGINT or SIGTERM.
+async fn wait_for_shutdown() {
+    let ctrl_c = signal::ctrl_c();
+    #[cfg(unix)]
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .expect("failed to install SIGTERM handler");
+
+    tokio::select! {
+        _ = ctrl_c => { info!("received SIGINT"); }
+        _ = sigterm.recv() => { info!("received SIGTERM"); }
+    }
 }
