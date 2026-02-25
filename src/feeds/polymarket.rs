@@ -1,4 +1,9 @@
 //! Polymarket WebSocket orderbook stream.
+//!
+//! Protocol: wss://ws-subscriptions-clob.polymarket.com/ws/market
+//! - Connect, then send subscribe messages for each asset_id
+//! - Server sends "book" snapshots and "price_change" L2 deltas
+//! - Must respond to server pings; also send our own keepalive pings
 
 use std::sync::Arc;
 
@@ -17,9 +22,11 @@ use super::types::{BookLevel, FeedUpdate, OrderBook};
 struct WsMessage {
     event_type: Option<String>,
     asset_id: Option<String>,
+    #[allow(dead_code)]
     market: Option<String>,
     bids: Option<Vec<WsBookLevel>>,
     asks: Option<Vec<WsBookLevel>>,
+    #[allow(dead_code)]
     timestamp: Option<String>,
     price_changes: Option<Vec<WsPriceChange>>,
 }
@@ -58,10 +65,18 @@ impl PolymarketFeed {
 
     pub async fn run(&self) {
         let mut backoff_secs = 1u64;
-        let max_backoff = 30u64;
+        let max_backoff = 60u64;
 
         loop {
-            info!(url = %self.ws_url, "connecting to polymarket WS");
+            // Don't connect if nothing to subscribe to — just wait
+            let tokens = self.subscribed_tokens.read().clone();
+            if tokens.is_empty() {
+                debug!("polymarket WS: no tokens subscribed, waiting...");
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            info!(url = %self.ws_url, token_count = tokens.len(), "connecting to polymarket WS");
 
             match connect_async(&self.ws_url).await {
                 Ok((ws_stream, _)) => {
@@ -70,19 +85,25 @@ impl PolymarketFeed {
 
                     let (mut write, mut read) = ws_stream.split();
 
-                    // Subscribe to currently tracked tokens
-                    let tokens = self.subscribed_tokens.read().clone();
-                    if !tokens.is_empty() {
-                        let sub = serde_json::json!({
-                            "assets_ids": tokens,
-                            "type": "market",
-                            "custom_feature_enabled": true,
+                    // Subscribe to all tracked tokens
+                    for token_id in &tokens {
+                        let sub_msg = serde_json::json!({
+                            "auth": {},
+                            "markets": [token_id],
+                            "assets_ids": [token_id],
+                            "type": "market"
                         });
-                        let _ = write.send(tungstenite::Message::Text(sub.to_string())).await;
+                        if let Err(e) = write.send(tungstenite::Message::Text(sub_msg.to_string())).await {
+                            warn!(error = %e, "failed to send subscribe message");
+                            break;
+                        }
+                        debug!(token_id, "subscribed to PM orderbook");
                     }
 
-                    // Ping interval
+                    // Keepalive ping interval
                     let mut ping_interval = interval(Duration::from_secs(10));
+                    // Skip the immediate first tick
+                    ping_interval.tick().await;
 
                     loop {
                         tokio::select! {
@@ -91,11 +112,12 @@ impl PolymarketFeed {
                                     Some(Ok(tungstenite::Message::Text(text))) => {
                                         self.handle_message(&text);
                                     }
-                                    Some(Ok(tungstenite::Message::Ping(_))) => {
+                                    Some(Ok(tungstenite::Message::Ping(data))) => {
                                         debug!("polymarket ping received");
+                                        let _ = write.send(tungstenite::Message::Pong(data)).await;
                                     }
                                     Some(Ok(tungstenite::Message::Close(_))) => {
-                                        warn!("polymarket WS closed");
+                                        warn!("polymarket WS closed by server");
                                         break;
                                     }
                                     Some(Err(e)) => {
@@ -110,7 +132,11 @@ impl PolymarketFeed {
                                 }
                             }
                             _ = ping_interval.tick() => {
-                                let _ = write.send(tungstenite::Message::Text("PING".to_string())).await;
+                                // Send WebSocket-level ping frame (not text)
+                                if let Err(e) = write.send(tungstenite::Message::Ping(vec![])).await {
+                                    warn!(error = %e, "failed to send WS ping");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -126,15 +152,33 @@ impl PolymarketFeed {
     }
 
     fn handle_message(&self, text: &str) {
-        if text == "PONG" {
+        // Some servers send literal text pong
+        if text == "PONG" || text == "pong" {
             return;
+        }
+
+        // Try to parse as array first (PM sometimes sends arrays)
+        if text.starts_with('[') {
+            if let Ok(msgs) = serde_json::from_str::<Vec<WsMessage>>(text) {
+                for msg in msgs {
+                    self.process_message(msg);
+                }
+                return;
+            }
         }
 
         let msg: WsMessage = match serde_json::from_str(text) {
             Ok(m) => m,
-            Err(_) => return,
+            Err(e) => {
+                debug!(error = %e, text_len = text.len(), "failed to parse PM WS message");
+                return;
+            }
         };
 
+        self.process_message(msg);
+    }
+
+    fn process_message(&self, msg: WsMessage) {
         let event_type = msg.event_type.as_deref().unwrap_or("");
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -168,6 +212,13 @@ impl PolymarketFeed {
                         })
                         .collect();
 
+                    debug!(
+                        asset_id,
+                        bid_levels = bids.len(),
+                        ask_levels = asks.len(),
+                        "PM book snapshot"
+                    );
+
                     let book = OrderBook {
                         token_id: asset_id.clone(),
                         bids,
@@ -198,7 +249,6 @@ impl PolymarketFeed {
                         };
                         let side = change.side.unwrap_or_default();
 
-                        // Update the book in place
                         if let Some(mut book) = self.books.get_mut(&asset_id) {
                             let levels = if side == "BUY" {
                                 &mut book.bids
@@ -207,15 +257,12 @@ impl PolymarketFeed {
                             };
 
                             if size == 0.0 {
-                                // Remove level
                                 levels.retain(|l| (l.price - price).abs() > 0.00001);
                             } else {
-                                // Update or insert
                                 if let Some(lvl) = levels.iter_mut().find(|l| (l.price - price).abs() < 0.00001) {
                                     lvl.size = size;
                                 } else {
                                     levels.push(BookLevel { price, size });
-                                    // Re-sort: bids descending, asks ascending
                                     if side == "BUY" {
                                         levels.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
                                     } else {
@@ -236,7 +283,7 @@ impl PolymarketFeed {
                 }
             }
             _ => {
-                // Ignore other event types for now
+                debug!(event_type, "unknown PM WS event type");
             }
         }
     }
@@ -249,9 +296,7 @@ impl PolymarketFeed {
                 tokens.push(tid.clone());
             }
         }
-        // Note: actual WS subscription happens on next reconnect or via
-        // a dedicated control channel. For now, track desired subscriptions.
-        info!(tokens = ?token_ids, "subscribed to polymarket tokens");
+        info!(tokens = ?token_ids, "queued polymarket token subscriptions");
     }
 
     /// Unsubscribe from token orderbook updates.
