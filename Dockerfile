@@ -18,11 +18,12 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release 2>/dev/null || true
 RUN rm -rf src
 
-# Copy source and build for real
+# Copy source and build for real — bust cache via .build_id
+COPY .build_id .build_id
 COPY src/ src/
 COPY config/ config/
 COPY migrations/ migrations/
-RUN cargo build --release
+RUN touch src/main.rs && cargo build --release
 
 # --- Runtime stage ---
 FROM debian:bookworm-slim
@@ -35,10 +36,7 @@ COPY --from=builder /app/target/release/polymarket-maker-bot /app/polymarket-mak
 COPY config/ config/
 COPY migrations/ migrations/
 
-# Railway injects PORT env var for web services
 ENV RUST_LOG=info
 ENV PM__LOGGING__JSON_OUTPUT=false
-
-EXPOSE 8080
 
 CMD ["./polymarket-maker-bot"]
