@@ -37,7 +37,7 @@ COPY migrations/ migrations/
 
 # Railway injects PORT env var for web services
 ENV RUST_LOG=info
-ENV PM__LOGGING__JSON_OUTPUT=true
+ENV PM__LOGGING__JSON_OUTPUT=false
 
 EXPOSE 8080
 
