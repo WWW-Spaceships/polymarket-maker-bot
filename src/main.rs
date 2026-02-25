@@ -28,23 +28,28 @@ use crate::events::bus::EventBus;
 
 #[tokio::main]
 async fn main() {
+    // Print immediately so Railway logs show SOMETHING
+    eprintln!("polymarket-maker-bot process started");
+
     // Load .env file (ignore if missing)
     let _ = dotenvy::dotenv();
 
-    // Start health endpoint FIRST so Railway health check passes while we init
-    let health_port = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(8080);
-
-    tokio::spawn(run_health_server(health_port));
+    // Debug: print DATABASE_URL presence
+    eprintln!(
+        "env check: DATABASE_URL={}, PRIVATE_KEY={}, PORT={}",
+        if std::env::var("DATABASE_URL").is_ok() { "set" } else { "MISSING" },
+        if std::env::var("PRIVATE_KEY").is_ok() { "set" } else { "MISSING" },
+        std::env::var("PORT").unwrap_or_else(|_| "MISSING".into()),
+    );
 
     // Load configuration
     let config = match Config::load() {
-        Ok(c) => c,
+        Ok(c) => {
+            eprintln!("config loaded OK");
+            c
+        }
         Err(e) => {
             eprintln!("FATAL: config load failed: {e}");
-            // Keep health server alive so Railway logs are visible
             wait_for_shutdown().await;
             return;
         }
