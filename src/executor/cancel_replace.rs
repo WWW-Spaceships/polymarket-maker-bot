@@ -116,26 +116,30 @@ pub async fn run_cancel_replace_loop(
             last_log = Instant::now();
         }
 
-        // Taker edge alert: YES_ask + NO_ask < $1.00
-        if yes_ask > 0.0 && no_ask > 0.0 {
-            let combined = yes_ask + no_ask;
-            let edge = 1.0 - combined;
+        // Only check edge when prices are in the realistic zone (0.20-0.80).
+        // Bids at $0.01 are bottom-of-book noise, not real trading opportunities.
+        let prices_realistic = yes_bid >= 0.20 && no_bid >= 0.20
+            && yes_ask <= 0.80 && no_ask <= 0.80
+            && yes_ask > 0.0 && no_ask > 0.0;
 
-            if edge > config.arb.min_alert_edge_cents {
+        if prices_realistic {
+            let taker_combined = yes_ask + no_ask;
+            let taker_edge = 1.0 - taker_combined;
+            let maker_combined = yes_bid + no_bid;
+            let maker_edge = 1.0 - maker_combined;
+
+            // Taker edge: both asks sum to < $1.00
+            if taker_edge > config.arb.min_alert_edge_cents {
                 let yes_depth = yes_book.top_ask_size();
                 let no_depth = no_book.top_ask_size();
                 info!(
                     condition_id = %ctx.condition_id,
-                    asset = %ctx.asset,
-                    timeframe = %ctx.timeframe,
-                    yes_ask = yes_ask,
-                    no_ask = no_ask,
-                    combined = combined,
-                    edge_cents = format!("{:.4}", edge),
-                    yes_depth = yes_depth,
-                    no_depth = no_depth,
-                    secs_left = format!("{:.0}", secs_left),
-                    "🔥 TAKER NEG-VIG DETECTED"
+                    yes_ask, no_ask,
+                    combined = format!("{:.3}", taker_combined),
+                    edge = format!("{:.4}", taker_edge),
+                    yes_depth, no_depth,
+                    secs = format!("{:.0}", secs_left),
+                    "🔥 TAKER NEG-VIG"
                 );
 
                 event_bus.publish(BotEvent::NegVigDetected {
@@ -144,35 +148,27 @@ pub async fn run_cancel_replace_loop(
                     timeframe: ctx.timeframe.clone(),
                     yes_ask,
                     no_ask,
-                    combined,
-                    edge_cents: edge,
+                    combined: taker_combined,
+                    edge_cents: taker_edge,
                     yes_depth,
                     no_depth,
                     secs_left,
                 });
             }
-        }
 
-        // Maker edge alert: YES_bid + NO_bid < $1.00 (posting at bid on both sides)
-        if yes_bid > 0.0 && no_bid > 0.0 {
-            let maker_combined = yes_bid + no_bid;
-            let maker_edge = 1.0 - maker_combined;
-
+            // Maker edge: both bids sum to < $1.00 (what 0x8dxd does)
             if maker_edge > config.arb.min_alert_edge_cents {
                 let yes_bid_depth = yes_book.top_bid_size();
                 let no_bid_depth = no_book.top_bid_size();
                 info!(
                     condition_id = %ctx.condition_id,
-                    asset = %ctx.asset,
-                    timeframe = %ctx.timeframe,
-                    yes_bid = yes_bid,
-                    no_bid = no_bid,
-                    combined = maker_combined,
-                    edge_cents = format!("{:.4}", maker_edge),
+                    yes_bid, no_bid,
+                    combined = format!("{:.3}", maker_combined),
+                    edge = format!("{:.4}", maker_edge),
                     yes_depth = yes_bid_depth,
                     no_depth = no_bid_depth,
-                    secs_left = format!("{:.0}", secs_left),
-                    "💎 MAKER NEG-VIG DETECTED"
+                    secs = format!("{:.0}", secs_left),
+                    "💎 MAKER NEG-VIG"
                 );
             }
         }
