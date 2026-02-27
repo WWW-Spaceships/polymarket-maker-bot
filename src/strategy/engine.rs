@@ -13,6 +13,9 @@ use crate::strategy::risk::RiskManager;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum MarketState {
     Discovered,
+    /// Phase 0: monitoring books for neg-vig, no order placement.
+    Monitoring,
+    /// Legacy states (kept for future phases)
     Qualifying,
     Quoting,
     ArticleZone,
@@ -87,12 +90,16 @@ impl StrategyEngine {
     }
 
     /// Process a market and decide what action to take.
+    ///
+    /// PHASE 0: Monitor-only mode. All quoting/article logic is disabled.
+    /// The cancel/replace loop handles neg-vig monitoring directly.
+    /// This engine only manages state transitions (Discovered → Monitoring → Settlement).
     pub fn process_market(
         &self,
         market: &mut MarketContext,
-        oracle: &OracleSnapshot,
-        yes_book: &OrderBook,
-        inventory: &MarketInventory,
+        _oracle: &OracleSnapshot,
+        _yes_book: &OrderBook,
+        _inventory: &MarketInventory,
     ) -> StrategyAction {
         let secs_left = market.seconds_until_close();
 
@@ -104,79 +111,26 @@ impl StrategyEngine {
 
         match &market.state {
             MarketState::Discovered => {
-                // Transition to qualifying
-                market.state = MarketState::Qualifying;
+                market.state = MarketState::Monitoring;
                 StrategyAction::Hold
             }
-            MarketState::Qualifying => {
-                // Check if market qualifies for quoting
-                if secs_left < 5.0 {
-                    market.state = MarketState::Settlement;
-                    return StrategyAction::CancelAll;
-                }
-                if yes_book.asks.len() < 2 || yes_book.bids.len() < 2 {
-                    return StrategyAction::Hold; // Not enough book depth
-                }
-                if yes_book.spread() > 0.10 {
-                    return StrategyAction::Hold; // Spread too wide
-                }
-
-                market.state = MarketState::Quoting;
-                let quotes = self.pricer.compute_quotes(
-                    oracle,
-                    yes_book,
-                    secs_left,
-                    inventory,
-                    self.risk.get_max_order_size("BUY", inventory),
-                );
-                StrategyAction::PostQuotes(quotes)
-            }
-            MarketState::Quoting => {
-                // Check for state transitions
+            MarketState::Monitoring => {
                 if secs_left < 2.0 {
                     market.state = MarketState::Settlement;
                     return StrategyAction::CancelAll;
                 }
-
-                // Enter article zone for 5-min markets
-                if market.is_5min() && secs_left <= 10.0 {
-                    market.state = MarketState::ArticleZone;
-                    if let Some(article_order) = self.article.evaluate(oracle, yes_book, secs_left)
-                    {
-                        return StrategyAction::PostArticle(article_order);
-                    }
-                    return StrategyAction::CancelAll;
-                }
-
-                // Check feed health
-                if !oracle.binance_delta_1s.available {
-                    market.state = MarketState::Withdrawn;
-                    return StrategyAction::CancelAll;
-                }
-
-                // Normal quoting: compute new quotes
-                let quotes = self.pricer.compute_quotes(
-                    oracle,
-                    yes_book,
-                    secs_left,
-                    inventory,
-                    self.risk.get_max_order_size("BUY", inventory),
-                );
-                StrategyAction::PostQuotes(quotes)
+                // Phase 0: just monitor, no orders
+                StrategyAction::Hold
             }
-            MarketState::ArticleZone => {
-                if secs_left < 2.0 {
-                    market.state = MarketState::Settlement;
-                    return StrategyAction::CancelAll;
-                }
-                // Already in article zone, hold position
+            // Legacy states — treat as monitoring
+            MarketState::Qualifying | MarketState::Quoting | MarketState::ArticleZone => {
+                market.state = MarketState::Monitoring;
                 StrategyAction::Hold
             }
             MarketState::Settlement => StrategyAction::Hold,
             MarketState::Withdrawn => {
-                // Check if we can re-enter
-                if secs_left > 30.0 && oracle.binance_delta_1s.available {
-                    market.state = MarketState::Qualifying;
+                if secs_left > 30.0 {
+                    market.state = MarketState::Monitoring;
                 }
                 StrategyAction::Hold
             }
