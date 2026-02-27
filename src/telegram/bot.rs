@@ -538,6 +538,19 @@ fn format_event(event: &BotEvent) -> Option<String> {
             "📈 <b>Daily Summary</b>\nPnL: ${:.2} | Trades: {} | Win: {:.1}%\nRebates: ${:.4}",
             total_pnl, trades_count, win_rate * 100.0, rebates_usdc
         )),
+        BotEvent::NegVigDetected { condition_id, asset, timeframe, yes_ask, no_ask, combined, edge_cents, yes_depth, no_depth, secs_left } => Some(format!(
+            "💎 <b>NEG-VIG DETECTED</b>\n\
+            {} {} — {:.0}s left\n\
+            YES ask: {:.4} | NO ask: {:.4}\n\
+            Combined: {:.4} | <b>Edge: {:.4}¢</b>\n\
+            Depth: YES {:.0} / NO {:.0}\n\
+            <code>{}…</code>",
+            asset.to_uppercase(), timeframe, secs_left,
+            yes_ask, no_ask,
+            combined, edge_cents * 100.0,
+            yes_depth, no_depth,
+            &condition_id[..condition_id.len().min(16)],
+        )),
         _ => None,
     }
 }

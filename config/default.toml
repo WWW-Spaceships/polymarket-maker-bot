@@ -44,6 +44,10 @@ entry_price_cap = 0.95         # Max entry price (cap at 95c)
 trigger_seconds_before_close = 10.0
 min_seconds_before_close = 2.0
 
+[arb]
+monitor_only = true            # Phase 0: just log/alert, don't trade
+min_alert_edge_cents = 0.005   # Alert when edge > 0.5 cents per share
+
 [feeds]
 binance_ws_url = "wss://stream.binance.com:9443/ws"
 coinbase_ws_url = "wss://ws-feed.exchange.coinbase.com"

@@ -73,10 +73,62 @@ pub async fn run_cancel_replace_loop(
         // 2. Get oracle snapshot for this market's asset
         let oracle = feed_hub.oracle_snapshot(&ctx.asset);
 
-        // 3. Get YES token orderbook
+        // 3. Get YES + NO token orderbooks
         let yes_book = feed_hub
             .get_book(&ctx.yes_token_id)
             .unwrap_or_else(|| crate::feeds::types::OrderBook::empty(ctx.yes_token_id.clone()));
+        let no_book = feed_hub
+            .get_book(&ctx.no_token_id)
+            .unwrap_or_else(|| crate::feeds::types::OrderBook::empty(ctx.no_token_id.clone()));
+
+        // 3a. Neg-vig monitor — check if YES_ask + NO_ask < $1.00
+        let yes_ask = yes_book.best_ask();
+        let no_ask = no_book.best_ask();
+        if yes_ask > 0.0 && no_ask > 0.0 {
+            let combined = yes_ask + no_ask;
+            let edge = 1.0 - combined;
+            let secs_left = ctx.seconds_until_close();
+
+            if edge > config.arb.min_alert_edge_cents {
+                let yes_depth = yes_book.top_ask_size();
+                let no_depth = no_book.top_ask_size();
+                info!(
+                    condition_id = %ctx.condition_id,
+                    asset = %ctx.asset,
+                    timeframe = %ctx.timeframe,
+                    yes_ask = yes_ask,
+                    no_ask = no_ask,
+                    combined = combined,
+                    edge_cents = format!("{:.4}", edge),
+                    yes_depth = yes_depth,
+                    no_depth = no_depth,
+                    secs_left = format!("{:.0}", secs_left),
+                    "NEG-VIG DETECTED"
+                );
+
+                event_bus.publish(BotEvent::NegVigDetected {
+                    condition_id: ctx.condition_id.clone(),
+                    asset: ctx.asset.clone(),
+                    timeframe: ctx.timeframe.clone(),
+                    yes_ask,
+                    no_ask,
+                    combined,
+                    edge_cents: edge,
+                    yes_depth,
+                    no_depth,
+                    secs_left,
+                });
+            } else {
+                debug!(
+                    condition_id = %ctx.condition_id,
+                    yes_ask = yes_ask,
+                    no_ask = no_ask,
+                    combined = format!("{:.4}", combined),
+                    edge = format!("{:.4}", edge),
+                    "vig check"
+                );
+            }
+        }
 
         // 4. Get current inventory
         let inventory = position_tracker.get_inventory(&ctx.condition_id);

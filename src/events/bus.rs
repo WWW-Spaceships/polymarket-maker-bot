@@ -71,6 +71,19 @@ pub enum BotEvent {
         win_rate: f64,
         rebates_usdc: f64,
     },
+    /// Negative-vig opportunity detected (YES_ask + NO_ask < $1.00).
+    NegVigDetected {
+        condition_id: String,
+        asset: String,
+        timeframe: String,
+        yes_ask: f64,
+        no_ask: f64,
+        combined: f64,
+        edge_cents: f64,
+        yes_depth: f64,
+        no_depth: f64,
+        secs_left: f64,
+    },
 }
 
 /// Central event bus for broadcasting events to all subscribers.

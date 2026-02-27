@@ -15,6 +15,7 @@ pub struct Config {
     pub strategy: StrategyConfig,
     pub risk: RiskConfig,
     pub article: ArticleConfig,
+    pub arb: ArbConfig,
     pub feeds: FeedConfig,
     pub discovery: DiscoveryConfig,
     pub database: DatabaseConfig,
@@ -201,6 +202,20 @@ fn default_article_trigger_secs() -> f64 {
 }
 fn default_article_min_secs() -> f64 {
     2.0
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArbConfig {
+    /// Monitor-only mode — log neg-vig opportunities without acting on them.
+    #[serde(default = "default_true")]
+    pub monitor_only: bool,
+    /// Minimum edge in cents to trigger a Telegram alert.
+    #[serde(default = "default_min_alert_edge")]
+    pub min_alert_edge_cents: f64,
+}
+
+fn default_min_alert_edge() -> f64 {
+    0.005
 }
 
 #[derive(Debug, Clone, Deserialize)]
