@@ -1,10 +1,12 @@
 //! Risk management — position limits, exposure caps, circuit breaker.
 
 use crate::config::RiskConfig;
+use crate::events::bus::{BotEvent, EventBus};
 use crate::strategy::pricing::MarketInventory;
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Current portfolio risk state.
 #[derive(Debug, Clone, Serialize)]
@@ -22,16 +24,18 @@ pub struct RiskManager {
     daily_pnl: RwLock<f64>,
     total_exposure: RwLock<f64>,
     active_market_count: RwLock<usize>,
+    event_bus: Arc<EventBus>,
 }
 
 impl RiskManager {
-    pub fn new(config: RiskConfig) -> Self {
+    pub fn new(config: RiskConfig, event_bus: Arc<EventBus>) -> Self {
         Self {
             config,
             halted: AtomicBool::new(false),
             daily_pnl: RwLock::new(0.0),
             total_exposure: RwLock::new(0.0),
             active_market_count: RwLock::new(0),
+            event_bus,
         }
     }
 
@@ -105,12 +109,28 @@ impl RiskManager {
         let mut dpnl = self.daily_pnl.write();
         *dpnl += pnl_change;
         if *dpnl < -self.config.max_daily_loss_usd {
-            self.halted.store(true, Ordering::Relaxed);
+            let was_halted = self.halted.swap(true, Ordering::Relaxed);
             tracing::error!(
                 daily_pnl = *dpnl,
                 limit = -self.config.max_daily_loss_usd,
                 "CIRCUIT BREAKER TRIPPED — halting all quoting"
             );
+            if !was_halted {
+                self.event_bus.publish(BotEvent::CircuitBreaker {
+                    daily_pnl: *dpnl,
+                });
+            }
+        }
+
+        // Publish risk alert if approaching limit (>75% of max loss)
+        let threshold = -self.config.max_daily_loss_usd * 0.75;
+        if *dpnl < threshold && *dpnl >= -self.config.max_daily_loss_usd {
+            let exposure = *self.total_exposure.read();
+            self.event_bus.publish(BotEvent::RiskAlert {
+                message: format!("Daily PnL at {:.1}% of limit", (*dpnl / -self.config.max_daily_loss_usd) * 100.0),
+                daily_pnl: *dpnl,
+                exposure_usd: exposure,
+            });
         }
     }
 

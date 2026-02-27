@@ -94,7 +94,7 @@ async fn main() {
     let position_tracker = Arc::new(position::tracker::PositionTracker::new(db_pool.clone()));
 
     // Initialize risk manager
-    let risk_manager = Arc::new(strategy::risk::RiskManager::new(config.risk.clone()));
+    let risk_manager = Arc::new(strategy::risk::RiskManager::new(config.risk.clone(), event_bus.clone()));
 
     // Initialize fee calculator (awareness only — makers pay 0)
     let _fee_calc = fees::calculator::FeeCalculator::new();
@@ -122,6 +122,7 @@ async fn main() {
         config.clob.base_url.clone(),
         config.auth.clone(),
         db_pool.clone(),
+        event_bus.clone(),
     ));
 
     // Initialize market discovery
@@ -144,6 +145,7 @@ async fn main() {
     let order_mgr_disc = order_manager.clone();
     let risk_disc = risk_manager.clone();
     let pos_disc = position_tracker.clone();
+    let event_bus_disc = event_bus.clone();
     let db_disc = db_pool.clone();
     let config_disc = config.clone();
     tokio::spawn(async move {
@@ -154,6 +156,7 @@ async fn main() {
             order_mgr_disc,
             risk_disc,
             pos_disc,
+            event_bus_disc,
             db_disc,
             config_disc,
         )
@@ -162,9 +165,18 @@ async fn main() {
 
     // Spawn Telegram bot (if configured)
     if config.telegram.bot_token.is_some() {
+        let tg_state = Arc::new(telegram::bot::TelegramState {
+            position_tracker: position_tracker.clone(),
+            order_manager: order_manager.clone(),
+            feed_hub: feed_hub.clone(),
+            discovery: discovery.clone(),
+            risk_manager: risk_manager.clone(),
+            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
         let tg = telegram::bot::TelegramBot::new(
             config.telegram.clone(),
             event_bus.subscribe(),
+            tg_state,
         );
         tokio::spawn(async move {
             if let Err(e) = tg.run().await {

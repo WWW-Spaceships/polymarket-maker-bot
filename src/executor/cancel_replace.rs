@@ -17,6 +17,7 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::events::bus::{BotEvent, EventBus};
 use crate::feeds::FeedHub;
 use crate::position::tracker::PositionTracker;
 use crate::strategy::engine::{MarketContext, StrategyAction, StrategyEngine};
@@ -34,6 +35,7 @@ pub async fn run_cancel_replace_loop(
     order_manager: Arc<OrderManager>,
     _risk_manager: Arc<RiskManager>,
     position_tracker: Arc<PositionTracker>,
+    event_bus: Arc<EventBus>,
     config: Arc<Config>,
     _db: PgPool,
 ) {
@@ -115,6 +117,14 @@ pub async fn run_cancel_replace_loop(
                     conviction = article_order.conviction,
                     "firing article strategy"
                 );
+
+                event_bus.publish(BotEvent::ArticleFired {
+                    condition_id: condition_id.clone(),
+                    direction: article_order.direction.clone(),
+                    price: article_order.price,
+                    size: article_order.size,
+                    conviction: article_order.conviction,
+                });
 
                 // Cancel existing quotes first
                 let _ = order_manager

@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::AuthConfig;
 use crate::db::queries;
+use crate::events::bus::{BotEvent, EventBus};
 
 /// A live order tracked in memory.
 #[derive(Debug, Clone, Serialize)]
@@ -51,17 +52,19 @@ pub struct OrderManager {
     base_url: String,
     auth: AuthConfig,
     db: PgPool,
+    event_bus: Arc<EventBus>,
     /// In-memory tracking of all live (posted, not yet filled/cancelled) orders.
     pub live_orders: Arc<DashMap<String, LiveOrder>>,
 }
 
 impl OrderManager {
-    pub fn new(base_url: String, auth: AuthConfig, db: PgPool) -> Self {
+    pub fn new(base_url: String, auth: AuthConfig, db: PgPool, event_bus: Arc<EventBus>) -> Self {
         Self {
             client: Client::new(),
             base_url,
             auth,
             db,
+            event_bus,
             live_orders: Arc::new(DashMap::new()),
         }
     }
@@ -122,6 +125,15 @@ impl OrderManager {
                     market_db_id,
                 },
             );
+
+            self.event_bus.publish(BotEvent::OrderPosted {
+                order_id: fake_id.clone(),
+                token_id: token_id.to_string(),
+                side: side.to_string(),
+                price,
+                size,
+                strategy: strategy.to_string(),
+            });
 
             return Ok(Some(fake_id));
         }
@@ -212,6 +224,15 @@ impl OrderManager {
                 },
             );
 
+            self.event_bus.publish(BotEvent::OrderPosted {
+                order_id: order_id.clone(),
+                token_id: token_id.to_string(),
+                side: side.to_string(),
+                price,
+                size,
+                strategy: strategy.to_string(),
+            });
+
             Ok(Some(order_id.clone()))
         } else {
             warn!(
@@ -233,6 +254,11 @@ impl OrderManager {
 
         // Update DB status
         let _ = queries::update_maker_order_status(&self.db, order_id, "cancelled", None, None).await;
+
+        self.event_bus.publish(BotEvent::OrderCancelled {
+            order_id: order_id.to_string(),
+            reason: if paper_mode { "paper_cancel".to_string() } else { "cancel_replace".to_string() },
+        });
 
         if paper_mode {
             info!(order_id, "[PAPER] would cancel order");
@@ -368,6 +394,13 @@ impl OrderManager {
             fully_filled,
             "order filled"
         );
+
+        self.event_bus.publish(BotEvent::OrderFilled {
+            order_id: order_id.to_string(),
+            fill_price,
+            fill_size,
+            fully_filled,
+        });
 
         let status = if fully_filled {
             "filled"

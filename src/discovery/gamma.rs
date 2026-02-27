@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{Config, DiscoveryConfig};
 use crate::db::queries;
+use crate::events::bus::{BotEvent, EventBus};
 use crate::executor::cancel_replace;
 use crate::executor::order_manager::OrderManager;
 use crate::feeds::FeedHub;
@@ -197,6 +198,7 @@ pub async fn run_discovery_loop(
     order_manager: Arc<OrderManager>,
     risk_manager: Arc<RiskManager>,
     position_tracker: Arc<PositionTracker>,
+    event_bus: Arc<EventBus>,
     db: PgPool,
     config: Config,
 ) {
@@ -250,6 +252,12 @@ pub async fn run_discovery_loop(
                             "discovered new market"
                         );
 
+                        event_bus.publish(BotEvent::MarketDiscovered {
+                            condition_id: condition_id.clone(),
+                            asset: ctx.asset.clone(),
+                            timeframe: ctx.timeframe.clone(),
+                        });
+
                         // Subscribe to orderbook feeds
                         feed_hub
                             .subscribe_market(&ctx.yes_token_id, &ctx.no_token_id)
@@ -269,13 +277,14 @@ pub async fn run_discovery_loop(
                         let om = order_manager.clone();
                         let rm = risk_manager.clone();
                         let pt = position_tracker.clone();
+                        let eb = event_bus.clone();
                         let cfg = config.clone();
                         let db2 = db.clone();
                         let disc = discovery.clone();
 
                         tokio::spawn(async move {
                             cancel_replace::run_cancel_replace_loop(
-                                market, fh, se, om, rm, pt, cfg, db2,
+                                market, fh, se, om, rm, pt, eb, cfg, db2,
                             )
                             .await;
 
