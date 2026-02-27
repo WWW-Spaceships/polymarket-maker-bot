@@ -4,6 +4,9 @@
 //! - Connect, then send subscribe messages for each asset_id
 //! - Server sends "book" snapshots and "price_change" L2 deltas
 //! - Must respond to server pings; also send our own keepalive pings
+//!
+//! IMPORTANT: Polymarket WS does NOT reliably re-subscribe on an existing
+//! connection. When new tokens are added, we must RECONNECT.
 
 use std::sync::Arc;
 
@@ -11,7 +14,7 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use serde::Deserialize;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use tokio::time::{sleep, Duration, interval};
 use tokio_tungstenite::{connect_async, tungstenite};
 use tracing::{debug, error, info, warn};
@@ -51,6 +54,8 @@ pub struct PolymarketFeed {
     books: Arc<DashMap<String, OrderBook>>,
     subscribed_tokens: Arc<RwLock<Vec<String>>>,
     update_tx: broadcast::Sender<FeedUpdate>,
+    /// Notify to trigger a reconnect when new tokens are added.
+    reconnect_notify: Arc<Notify>,
 }
 
 impl PolymarketFeed {
@@ -60,7 +65,13 @@ impl PolymarketFeed {
             books: Arc::new(DashMap::new()),
             subscribed_tokens: Arc::new(RwLock::new(Vec::new())),
             update_tx,
+            reconnect_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Get a reference to the reconnect notifier (for discovery to trigger reconnects).
+    pub fn reconnect_notifier(&self) -> Arc<Notify> {
+        self.reconnect_notify.clone()
     }
 
     pub async fn run(&self) {
@@ -72,7 +83,13 @@ impl PolymarketFeed {
             let tokens = self.subscribed_tokens.read().clone();
             if tokens.is_empty() {
                 debug!("polymarket WS: no tokens subscribed, waiting...");
-                sleep(Duration::from_secs(5)).await;
+                // Wait for either a reconnect signal or a timeout
+                tokio::select! {
+                    _ = self.reconnect_notify.notified() => {
+                        debug!("polymarket WS: reconnect signal received, checking tokens");
+                    }
+                    _ = sleep(Duration::from_secs(2)) => {}
+                }
                 continue;
             }
 
@@ -81,29 +98,36 @@ impl PolymarketFeed {
             match connect_async(&self.ws_url).await {
                 Ok((ws_stream, _)) => {
                     backoff_secs = 1;
-                    info!("polymarket WS connected");
+                    info!(token_count = tokens.len(), "polymarket WS connected");
 
                     let (mut write, mut read) = ws_stream.split();
 
-                    // Subscribe to all tracked tokens
-                    for token_id in &tokens {
-                        let sub_msg = serde_json::json!({
-                            "auth": {},
-                            "markets": [token_id],
-                            "assets_ids": [token_id],
-                            "type": "market"
-                        });
-                        if let Err(e) = write.send(tungstenite::Message::Text(sub_msg.to_string())).await {
-                            warn!(error = %e, "failed to send subscribe message");
-                            break;
-                        }
-                        debug!(token_id, "subscribed to PM orderbook");
+                    // Subscribe to all tracked tokens in a single message
+                    let all_token_ids: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+                    let sub_msg = serde_json::json!({
+                        "auth": {},
+                        "markets": &all_token_ids,
+                        "assets_ids": &all_token_ids,
+                        "type": "market"
+                    });
+                    if let Err(e) = write
+                        .send(tungstenite::Message::Text(sub_msg.to_string()))
+                        .await
+                    {
+                        warn!(error = %e, "failed to send subscribe message");
+                        sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(max_backoff);
+                        continue;
                     }
+                    info!(tokens = ?all_token_ids.len(), "subscribed to PM orderbooks");
 
                     // Keepalive ping interval
                     let mut ping_interval = interval(Duration::from_secs(10));
                     // Skip the immediate first tick
                     ping_interval.tick().await;
+
+                    // Track the token set we connected with
+                    let connected_token_count = tokens.len();
 
                     loop {
                         tokio::select! {
@@ -132,9 +156,23 @@ impl PolymarketFeed {
                                 }
                             }
                             _ = ping_interval.tick() => {
-                                // Send WebSocket-level ping frame (not text)
+                                // Send WebSocket-level ping frame
                                 if let Err(e) = write.send(tungstenite::Message::Ping(vec![])).await {
                                     warn!(error = %e, "failed to send WS ping");
+                                    break;
+                                }
+                            }
+                            _ = self.reconnect_notify.notified() => {
+                                // New tokens were added — need to reconnect
+                                let new_count = self.subscribed_tokens.read().len();
+                                if new_count != connected_token_count {
+                                    info!(
+                                        old_count = connected_token_count,
+                                        new_count = new_count,
+                                        "new tokens added, reconnecting WS"
+                                    );
+                                    // Close cleanly
+                                    let _ = write.send(tungstenite::Message::Close(None)).await;
                                     break;
                                 }
                             }
@@ -259,14 +297,24 @@ impl PolymarketFeed {
                             if size == 0.0 {
                                 levels.retain(|l| (l.price - price).abs() > 0.00001);
                             } else {
-                                if let Some(lvl) = levels.iter_mut().find(|l| (l.price - price).abs() < 0.00001) {
+                                if let Some(lvl) =
+                                    levels.iter_mut().find(|l| (l.price - price).abs() < 0.00001)
+                                {
                                     lvl.size = size;
                                 } else {
                                     levels.push(BookLevel { price, size });
                                     if side == "BUY" {
-                                        levels.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+                                        levels.sort_by(|a, b| {
+                                            b.price
+                                                .partial_cmp(&a.price)
+                                                .unwrap_or(std::cmp::Ordering::Equal)
+                                        });
                                     } else {
-                                        levels.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+                                        levels.sort_by(|a, b| {
+                                            a.price
+                                                .partial_cmp(&b.price)
+                                                .unwrap_or(std::cmp::Ordering::Equal)
+                                        });
                                     }
                                 }
                             }
@@ -291,12 +339,18 @@ impl PolymarketFeed {
     /// Subscribe to token orderbook updates.
     pub async fn subscribe(&self, token_ids: Vec<String>) {
         let mut tokens = self.subscribed_tokens.write();
+        let mut added = false;
         for tid in &token_ids {
             if !tokens.contains(tid) {
                 tokens.push(tid.clone());
+                added = true;
             }
         }
-        info!(tokens = ?token_ids, "queued polymarket token subscriptions");
+        if added {
+            info!(tokens = ?token_ids, total = tokens.len(), "queued polymarket token subscriptions");
+            drop(tokens); // Release lock before notifying
+            self.reconnect_notify.notify_one();
+        }
     }
 
     /// Unsubscribe from token orderbook updates.

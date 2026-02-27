@@ -56,10 +56,10 @@ oracle_stale_max_ms = 2000.0   # Feed considered stale after 2s
 book_stale_max_ms = 3000.0     # Book considered stale after 3s
 
 [discovery]
-poll_interval_ms = 1500        # Poll Gamma API every 1.5s
+poll_interval_ms = 10000       # Check for new markets every 10s (slug-based, lightweight)
 allowed_assets = ["btc", "eth"]
 allowed_timeframes = ["5min", "15min"]
-max_tracked_markets = 50
+max_tracked_markets = 3        # Only track nearest 2-3 markets
 
 [database]
 # url set via DATABASE_URL env var

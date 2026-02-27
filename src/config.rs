@@ -267,7 +267,7 @@ fn default_allowed_timeframes() -> Vec<String> {
     vec!["5min".into(), "15min".into()]
 }
 fn default_max_tracked() -> usize {
-    50
+    3
 }
 
 #[derive(Debug, Clone, Deserialize)]
