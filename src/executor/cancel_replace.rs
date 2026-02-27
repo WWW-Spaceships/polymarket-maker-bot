@@ -25,6 +25,22 @@ use crate::strategy::risk::RiskManager;
 
 use super::order_manager::OrderManager;
 
+/// Track edge state per market to avoid spamming the same alert.
+#[derive(Default)]
+struct EdgeTracker {
+    /// Last maker edge we alerted on (None = no active edge window)
+    maker_edge_active: bool,
+    /// Last taker edge we alerted on
+    taker_edge_active: bool,
+    /// When the current edge window opened
+    edge_window_start: Option<Instant>,
+    /// Last prices we alerted on (for dedup)
+    last_yes_bid: f64,
+    last_no_bid: f64,
+    last_yes_ask: f64,
+    last_no_ask: f64,
+}
+
 /// Run the cancel/replace loop for a single market.
 /// This function runs until the market reaches Settlement or Withdrawn state
 /// and should be spawned as a tokio task per active market.
@@ -47,6 +63,7 @@ pub async fn run_cancel_replace_loop(
     }
 
     let mut last_log = Instant::now();
+    let mut edge_tracker = EdgeTracker::default();
 
     loop {
         let cycle_start = Instant::now();
@@ -90,86 +107,147 @@ pub async fn run_cancel_replace_loop(
         let no_bid = no_book.best_bid();
         let secs_left = ctx.seconds_until_close();
 
-        // Periodic book state log (every 5 seconds per market)
-        if last_log.elapsed() >= Duration::from_secs(5) && (yes_ask > 0.0 || no_ask > 0.0) {
-            let taker_combined = yes_ask + no_ask;
-            let taker_edge = 1.0 - taker_combined;
-            let maker_combined = yes_bid + no_bid;
-            let maker_edge = 1.0 - maker_combined;
-            let yes_spread = if yes_ask > 0.0 && yes_bid > 0.0 { yes_ask - yes_bid } else { 0.0 };
-            let no_spread = if no_ask > 0.0 && no_bid > 0.0 { no_ask - no_bid } else { 0.0 };
-            info!(
-                cid = &ctx.condition_id[..ctx.condition_id.len().min(10)],
-                secs = format!("{:.0}", secs_left),
-                up_bid = format!("{:.2}", yes_bid),
-                up_ask = format!("{:.2}", yes_ask),
-                dn_bid = format!("{:.2}", no_bid),
-                dn_ask = format!("{:.2}", no_ask),
-                taker = format!("{:.3}", taker_combined),
-                maker = format!("{:.3}", maker_combined),
-                t_edge = format!("{:.4}", taker_edge),
-                m_edge = format!("{:.4}", maker_edge),
-                up_sprd = format!("{:.2}", yes_spread),
-                dn_sprd = format!("{:.2}", no_spread),
-                "📊 BOOK"
-            );
+        // --- Price realism filter ---
+        // Only consider prices in 0.20-0.80 as real tradeable liquidity.
+        // Bids at $0.01 / asks at $0.99 are empty-book placeholders.
+        let has_real_book = yes_bid >= 0.10 && no_bid >= 0.10
+            && yes_ask <= 0.90 && no_ask <= 0.90
+            && yes_ask > 0.0 && no_ask > 0.0;
+
+        let maker_combined = yes_bid + no_bid;
+        let maker_edge = 1.0 - maker_combined;
+        let taker_combined = yes_ask + no_ask;
+        let taker_edge = 1.0 - taker_combined;
+
+        // --- Periodic book summary (every 10s, only markets with real books) ---
+        if last_log.elapsed() >= Duration::from_secs(10) {
+            if has_real_book {
+                info!(
+                    cid = &ctx.condition_id[..ctx.condition_id.len().min(10)],
+                    secs = format!("{:.0}", secs_left),
+                    up = format!("{:.2}/{:.2}", yes_bid, yes_ask),
+                    dn = format!("{:.2}/{:.2}", no_bid, no_ask),
+                    m_edge = format!("{:.1}¢", maker_edge * 100.0),
+                    t_edge = format!("{:.1}¢", taker_edge * 100.0),
+                    "📊 BOOK"
+                );
+            } else {
+                debug!(
+                    cid = &ctx.condition_id[..ctx.condition_id.len().min(10)],
+                    secs = format!("{:.0}", secs_left),
+                    "📊 no real book yet"
+                );
+            }
             last_log = Instant::now();
         }
 
-        // Only check edge when prices are in the realistic zone (0.20-0.80).
-        // Bids at $0.01 are bottom-of-book noise, not real trading opportunities.
-        let prices_realistic = yes_bid >= 0.20 && no_bid >= 0.20
-            && yes_ask <= 0.80 && no_ask <= 0.80
-            && yes_ask > 0.0 && no_ask > 0.0;
+        // --- Edge detection with deduplication ---
+        if has_real_book {
+            let min_edge = config.arb.min_alert_edge_cents;
 
-        if prices_realistic {
-            let taker_combined = yes_ask + no_ask;
-            let taker_edge = 1.0 - taker_combined;
-            let maker_combined = yes_bid + no_bid;
-            let maker_edge = 1.0 - maker_combined;
+            // Did prices actually change from last alert? (dedup)
+            let prices_changed = (yes_bid - edge_tracker.last_yes_bid).abs() > 0.001
+                || (no_bid - edge_tracker.last_no_bid).abs() > 0.001
+                || (yes_ask - edge_tracker.last_yes_ask).abs() > 0.001
+                || (no_ask - edge_tracker.last_no_ask).abs() > 0.001;
 
-            // Taker edge: both asks sum to < $1.00
-            if taker_edge > config.arb.min_alert_edge_cents {
-                let yes_depth = yes_book.top_ask_size();
-                let no_depth = no_book.top_ask_size();
+            // --- MAKER edge: posting GTC buys at bid on both sides ---
+            if maker_edge > min_edge {
+                if !edge_tracker.maker_edge_active || prices_changed {
+                    let yes_depth = yes_book.top_bid_size();
+                    let no_depth = no_book.top_bid_size();
+
+                    if !edge_tracker.maker_edge_active {
+                        edge_tracker.edge_window_start = Some(Instant::now());
+                    }
+
+                    info!(
+                        cid = &ctx.condition_id[..ctx.condition_id.len().min(10)],
+                        secs = format!("{:.0}", secs_left),
+                        up_bid = format!("{:.2}", yes_bid),
+                        dn_bid = format!("{:.2}", no_bid),
+                        cost = format!("{:.2}¢", maker_combined * 100.0),
+                        edge = format!("{:.1}¢", maker_edge * 100.0),
+                        up_depth = format!("{:.0}", yes_depth),
+                        dn_depth = format!("{:.0}", no_depth),
+                        "💎 MAKER EDGE"
+                    );
+                    edge_tracker.maker_edge_active = true;
+                }
+            } else if edge_tracker.maker_edge_active {
+                // Edge window closed — log how long it lasted
+                let duration = edge_tracker.edge_window_start
+                    .map(|s| s.elapsed().as_secs())
+                    .unwrap_or(0);
                 info!(
-                    condition_id = %ctx.condition_id,
-                    yes_ask, no_ask,
-                    combined = format!("{:.3}", taker_combined),
-                    edge = format!("{:.4}", taker_edge),
-                    yes_depth, no_depth,
-                    secs = format!("{:.0}", secs_left),
-                    "🔥 TAKER NEG-VIG"
+                    cid = &ctx.condition_id[..ctx.condition_id.len().min(10)],
+                    lasted_secs = duration,
+                    "💎 maker edge window CLOSED"
                 );
-
-                event_bus.publish(BotEvent::NegVigDetected {
-                    condition_id: ctx.condition_id.clone(),
-                    asset: ctx.asset.clone(),
-                    timeframe: ctx.timeframe.clone(),
-                    yes_ask,
-                    no_ask,
-                    combined: taker_combined,
-                    edge_cents: taker_edge,
-                    yes_depth,
-                    no_depth,
-                    secs_left,
-                });
+                edge_tracker.maker_edge_active = false;
+                edge_tracker.edge_window_start = None;
             }
 
-            // Maker edge: both bids sum to < $1.00 (what 0x8dxd does)
-            if maker_edge > config.arb.min_alert_edge_cents {
-                let yes_bid_depth = yes_book.top_bid_size();
-                let no_bid_depth = no_book.top_bid_size();
+            // --- TAKER edge: crossing both asks < $1.00 ---
+            if taker_edge > min_edge {
+                if !edge_tracker.taker_edge_active || prices_changed {
+                    let yes_depth = yes_book.top_ask_size();
+                    let no_depth = no_book.top_ask_size();
+
+                    info!(
+                        cid = &ctx.condition_id[..ctx.condition_id.len().min(10)],
+                        secs = format!("{:.0}", secs_left),
+                        up_ask = format!("{:.2}", yes_ask),
+                        dn_ask = format!("{:.2}", no_ask),
+                        cost = format!("{:.2}¢", taker_combined * 100.0),
+                        edge = format!("{:.1}¢", taker_edge * 100.0),
+                        up_depth = format!("{:.0}", yes_depth),
+                        dn_depth = format!("{:.0}", no_depth),
+                        "🔥 TAKER EDGE"
+                    );
+
+                    event_bus.publish(BotEvent::NegVigDetected {
+                        condition_id: ctx.condition_id.clone(),
+                        asset: ctx.asset.clone(),
+                        timeframe: ctx.timeframe.clone(),
+                        yes_ask,
+                        no_ask,
+                        combined: taker_combined,
+                        edge_cents: taker_edge,
+                        yes_depth,
+                        no_depth,
+                        secs_left,
+                    });
+                    edge_tracker.taker_edge_active = true;
+                }
+            } else {
+                edge_tracker.taker_edge_active = false;
+            }
+
+            // Update last-alerted prices for dedup
+            if prices_changed {
+                edge_tracker.last_yes_bid = yes_bid;
+                edge_tracker.last_no_bid = no_bid;
+                edge_tracker.last_yes_ask = yes_ask;
+                edge_tracker.last_no_ask = no_ask;
+            }
+        } else {
+            // Book went back to empty/unrealistic — close any active edge windows
+            if edge_tracker.maker_edge_active {
+                let duration = edge_tracker.edge_window_start
+                    .map(|s| s.elapsed().as_secs())
+                    .unwrap_or(0);
                 info!(
-                    condition_id = %ctx.condition_id,
-                    yes_bid, no_bid,
-                    combined = format!("{:.3}", maker_combined),
-                    edge = format!("{:.4}", maker_edge),
-                    yes_depth = yes_bid_depth,
-                    no_depth = no_bid_depth,
-                    secs = format!("{:.0}", secs_left),
-                    "💎 MAKER NEG-VIG"
+                    cid = &ctx.condition_id[..ctx.condition_id.len().min(10)],
+                    lasted_secs = duration,
+                    reason = "book emptied",
+                    "💎 maker edge window CLOSED"
                 );
+                edge_tracker.maker_edge_active = false;
+                edge_tracker.edge_window_start = None;
+            }
+            if edge_tracker.taker_edge_active {
+                edge_tracker.taker_edge_active = false;
             }
         }
 
