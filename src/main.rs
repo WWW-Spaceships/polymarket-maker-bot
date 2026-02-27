@@ -34,11 +34,14 @@ async fn main() {
     // Load .env file (ignore if missing)
     let _ = dotenvy::dotenv();
 
-    // Debug: print DATABASE_URL presence
+    // Debug: print env var presence
     eprintln!(
-        "env check: DATABASE_URL={}, PRIVATE_KEY={}, PORT={}",
+        "env check: DATABASE_URL={}, PRIVATE_KEY={}, CLOB_API_KEY={}, CLOB_SECRET={}, CLOB_PASSPHRASE={}, PORT={}",
         if std::env::var("DATABASE_URL").is_ok() { "set" } else { "MISSING" },
         if std::env::var("PRIVATE_KEY").is_ok() { "set" } else { "MISSING" },
+        if std::env::var("CLOB_API_KEY").is_ok() { "set" } else { "MISSING" },
+        if std::env::var("CLOB_SECRET").is_ok() { "set" } else { "MISSING" },
+        if std::env::var("CLOB_PASSPHRASE").is_ok() { "set" } else { "MISSING" },
         std::env::var("PORT").unwrap_or_else(|_| "MISSING".into()),
     );
 
