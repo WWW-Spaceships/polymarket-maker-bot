@@ -39,12 +39,14 @@ pub async fn run_cancel_replace_loop(
     config: Arc<Config>,
     _db: PgPool,
 ) {
-    let cycle_interval = Duration::from_millis(50);
+    let cycle_interval = Duration::from_millis(500); // Phase 0: 500ms is fine for monitoring
 
     {
         let cid = market.lock().await.condition_id.clone();
         info!(condition_id = %cid, "cancel/replace loop started");
     }
+
+    let mut last_log = Instant::now();
 
     loop {
         let cycle_start = Instant::now();
@@ -81,13 +83,43 @@ pub async fn run_cancel_replace_loop(
             .get_book(&ctx.no_token_id)
             .unwrap_or_else(|| crate::feeds::types::OrderBook::empty(ctx.no_token_id.clone()));
 
-        // 3a. Neg-vig monitor — check if YES_ask + NO_ask < $1.00
+        // 3a. Neg-vig monitor — check spreads on both sides
         let yes_ask = yes_book.best_ask();
         let no_ask = no_book.best_ask();
+        let yes_bid = yes_book.best_bid();
+        let no_bid = no_book.best_bid();
+        let secs_left = ctx.seconds_until_close();
+
+        // Periodic book state log (every 5 seconds per market)
+        if last_log.elapsed() >= Duration::from_secs(5) && (yes_ask > 0.0 || no_ask > 0.0) {
+            let taker_combined = yes_ask + no_ask;
+            let taker_edge = 1.0 - taker_combined;
+            let maker_combined = yes_bid + no_bid;
+            let maker_edge = 1.0 - maker_combined;
+            let yes_spread = if yes_ask > 0.0 && yes_bid > 0.0 { yes_ask - yes_bid } else { 0.0 };
+            let no_spread = if no_ask > 0.0 && no_bid > 0.0 { no_ask - no_bid } else { 0.0 };
+            info!(
+                cid = &ctx.condition_id[..ctx.condition_id.len().min(10)],
+                secs = format!("{:.0}", secs_left),
+                up_bid = format!("{:.2}", yes_bid),
+                up_ask = format!("{:.2}", yes_ask),
+                dn_bid = format!("{:.2}", no_bid),
+                dn_ask = format!("{:.2}", no_ask),
+                taker = format!("{:.3}", taker_combined),
+                maker = format!("{:.3}", maker_combined),
+                t_edge = format!("{:.4}", taker_edge),
+                m_edge = format!("{:.4}", maker_edge),
+                up_sprd = format!("{:.2}", yes_spread),
+                dn_sprd = format!("{:.2}", no_spread),
+                "📊 BOOK"
+            );
+            last_log = Instant::now();
+        }
+
+        // Taker edge alert: YES_ask + NO_ask < $1.00
         if yes_ask > 0.0 && no_ask > 0.0 {
             let combined = yes_ask + no_ask;
             let edge = 1.0 - combined;
-            let secs_left = ctx.seconds_until_close();
 
             if edge > config.arb.min_alert_edge_cents {
                 let yes_depth = yes_book.top_ask_size();
@@ -103,7 +135,7 @@ pub async fn run_cancel_replace_loop(
                     yes_depth = yes_depth,
                     no_depth = no_depth,
                     secs_left = format!("{:.0}", secs_left),
-                    "NEG-VIG DETECTED"
+                    "🔥 TAKER NEG-VIG DETECTED"
                 );
 
                 event_bus.publish(BotEvent::NegVigDetected {
@@ -118,14 +150,29 @@ pub async fn run_cancel_replace_loop(
                     no_depth,
                     secs_left,
                 });
-            } else {
-                debug!(
+            }
+        }
+
+        // Maker edge alert: YES_bid + NO_bid < $1.00 (posting at bid on both sides)
+        if yes_bid > 0.0 && no_bid > 0.0 {
+            let maker_combined = yes_bid + no_bid;
+            let maker_edge = 1.0 - maker_combined;
+
+            if maker_edge > config.arb.min_alert_edge_cents {
+                let yes_bid_depth = yes_book.top_bid_size();
+                let no_bid_depth = no_book.top_bid_size();
+                info!(
                     condition_id = %ctx.condition_id,
-                    yes_ask = yes_ask,
-                    no_ask = no_ask,
-                    combined = format!("{:.4}", combined),
-                    edge = format!("{:.4}", edge),
-                    "vig check"
+                    asset = %ctx.asset,
+                    timeframe = %ctx.timeframe,
+                    yes_bid = yes_bid,
+                    no_bid = no_bid,
+                    combined = maker_combined,
+                    edge_cents = format!("{:.4}", maker_edge),
+                    yes_depth = yes_bid_depth,
+                    no_depth = no_bid_depth,
+                    secs_left = format!("{:.0}", secs_left),
+                    "💎 MAKER NEG-VIG DETECTED"
                 );
             }
         }
