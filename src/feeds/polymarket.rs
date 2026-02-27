@@ -97,16 +97,15 @@ impl PolymarketFeed {
 
             match connect_async(&self.ws_url).await {
                 Ok((ws_stream, _)) => {
-                    backoff_secs = 1;
                     info!(token_count = tokens.len(), "polymarket WS connected");
 
                     let (mut write, mut read) = ws_stream.split();
 
-                    // Subscribe to all tracked tokens in a single message
+                    // Subscribe to all tracked tokens in a single message.
+                    // IMPORTANT: Do NOT include "markets" field — it causes server to reset connection.
+                    // Only "assets_ids" + "type" is needed. Cannot re-subscribe on same socket.
                     let all_token_ids: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
                     let sub_msg = serde_json::json!({
-                        "auth": {},
-                        "markets": &all_token_ids,
                         "assets_ids": &all_token_ids,
                         "type": "market"
                     });
@@ -134,6 +133,7 @@ impl PolymarketFeed {
                             msg = read.next() => {
                                 match msg {
                                     Some(Ok(tungstenite::Message::Text(text))) => {
+                                        backoff_secs = 1; // Reset backoff on successful data
                                         self.handle_message(&text);
                                     }
                                     Some(Ok(tungstenite::Message::Ping(data))) => {
