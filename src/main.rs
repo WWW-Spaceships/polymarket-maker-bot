@@ -117,13 +117,17 @@ async fn main() {
         risk_manager.clone(),
     ));
 
-    // Initialize order manager
-    let order_manager = Arc::new(executor::order_manager::OrderManager::new(
-        config.clob.base_url.clone(),
-        config.auth.clone(),
-        db_pool.clone(),
-        event_bus.clone(),
-    ));
+    // Initialize order manager (now async — authenticates with CLOB via SDK)
+    let order_manager = Arc::new(
+        executor::order_manager::OrderManager::new(
+            &config.clob.base_url,
+            &config.auth,
+            db_pool.clone(),
+            event_bus.clone(),
+        )
+        .await
+        .expect("failed to initialize order manager — check CLOB credentials"),
+    );
 
     // Initialize market discovery
     let discovery = Arc::new(discovery::gamma::GammaDiscovery::new(

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
 use tokio::time;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::events::bus::{BotEvent, EventBus};
@@ -39,6 +39,12 @@ struct EdgeTracker {
     last_no_bid: f64,
     last_yes_ask: f64,
     last_no_ask: f64,
+    /// Whether we already placed arb orders for this edge window
+    arb_orders_placed: bool,
+    /// How many UP shares we hold (from fills)
+    up_shares: f64,
+    /// How many DOWN shares we hold (from fills)
+    dn_shares: f64,
 }
 
 /// Run the cancel/replace loop for a single market.
@@ -159,6 +165,7 @@ pub async fn run_cancel_replace_loop(
 
                     if !edge_tracker.maker_edge_active {
                         edge_tracker.edge_window_start = Some(Instant::now());
+                        edge_tracker.arb_orders_placed = false;
                     }
 
                     info!(
@@ -174,6 +181,90 @@ pub async fn run_cancel_replace_loop(
                     );
                     edge_tracker.maker_edge_active = true;
                 }
+
+                // --- PLACE ARB ORDERS: Buy both UP and DOWN at bid ---
+                // Only place once per edge window, only if not already holding shares
+                if !edge_tracker.arb_orders_placed
+                    && !config.arb.monitor_only
+                    && secs_left > 60.0  // Don't enter with < 60s left
+                    && edge_tracker.up_shares < 1.0  // Not already holding
+                    && edge_tracker.dn_shares < 1.0
+                {
+                    // $1 per market: split between UP and DOWN
+                    // Buy at the bid price on each side
+                    let up_size = (config.arb.order_size_usd / yes_bid).floor().max(1.0);
+                    let dn_size = (config.arb.order_size_usd / no_bid).floor().max(1.0);
+
+                    // Store values before dropping ctx
+                    let cid = ctx.condition_id.clone();
+                    let yes_tid = ctx.yes_token_id.clone();
+                    let no_tid = ctx.no_token_id.clone();
+                    let db_id = ctx.db_market_id.unwrap_or(0);
+
+                    // Drop ctx lock before async I/O
+                    drop(ctx);
+
+                    info!(
+                        cid = &cid[..cid.len().min(10)],
+                        up_price = format!("{:.2}", yes_bid),
+                        dn_price = format!("{:.2}", no_bid),
+                        up_size = format!("{:.0}", up_size),
+                        dn_size = format!("{:.0}", dn_size),
+                        total_cost = format!("{:.2}", yes_bid * up_size + no_bid * dn_size),
+                        edge = format!("{:.1}¢", maker_edge * 100.0),
+                        "🎯 PLACING ARB ORDERS"
+                    );
+
+                    // Place UP BUY order
+                    match order_manager
+                        .post_order(
+                            &yes_tid,
+                            &cid,
+                            "BUY",
+                            yes_bid,
+                            up_size,
+                            "arb_up",
+                            db_id,
+                            config.trading.paper_mode,
+                        )
+                        .await
+                    {
+                        Ok(Some(id)) => info!(order_id = %id, side = "UP", "arb order posted"),
+                        Ok(None) => warn!("UP arb order returned no ID"),
+                        Err(e) => error!(error = %e, "failed to post UP arb order"),
+                    }
+
+                    // Place DOWN BUY order
+                    match order_manager
+                        .post_order(
+                            &no_tid,
+                            &cid,
+                            "BUY",
+                            no_bid,
+                            dn_size,
+                            "arb_dn",
+                            db_id,
+                            config.trading.paper_mode,
+                        )
+                        .await
+                    {
+                        Ok(Some(id)) => info!(order_id = %id, side = "DN", "arb order posted"),
+                        Ok(None) => warn!("DN arb order returned no ID"),
+                        Err(e) => error!(error = %e, "failed to post DN arb order"),
+                    }
+
+                    edge_tracker.arb_orders_placed = true;
+
+                    // Re-acquire ctx for the rest of the loop
+                    // We need to continue to the sleep at the end, skip the strategy engine
+                    let elapsed = cycle_start.elapsed();
+                    if elapsed < cycle_interval {
+                        time::sleep(cycle_interval - elapsed).await;
+                    } else {
+                        tokio::task::yield_now().await;
+                    }
+                    continue;
+                }
             } else if edge_tracker.maker_edge_active {
                 // Edge window closed — log how long it lasted
                 let duration = edge_tracker.edge_window_start
@@ -186,6 +277,7 @@ pub async fn run_cancel_replace_loop(
                 );
                 edge_tracker.maker_edge_active = false;
                 edge_tracker.edge_window_start = None;
+                edge_tracker.arb_orders_placed = false;
             }
 
             // --- TAKER edge: crossing both asks < $1.00 ---

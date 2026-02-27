@@ -212,6 +212,13 @@ pub struct ArbConfig {
     /// Minimum edge in cents to trigger a Telegram alert.
     #[serde(default = "default_min_alert_edge")]
     pub min_alert_edge_cents: f64,
+    /// USD to allocate per side of each arb (e.g. 0.50 = $0.50 UP + $0.50 DN = $1 total).
+    #[serde(default = "default_order_size_usd")]
+    pub order_size_usd: f64,
+}
+
+fn default_order_size_usd() -> f64 {
+    0.50
 }
 
 fn default_min_alert_edge() -> f64 {

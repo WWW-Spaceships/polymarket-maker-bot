@@ -2,8 +2,8 @@
 # Secrets (PRIVATE_KEY, DATABASE_URL, etc.) should be in .env or environment variables.
 
 [auth]
-# signature_type: 1 = EOA, 2 = Gnosis Safe
-signature_type = 1
+# signature_type: 0 = EOA, 1 = Poly Proxy, 2 = Gnosis Safe
+signature_type = 0
 
 [clob]
 base_url = "https://clob.polymarket.com"
@@ -13,8 +13,8 @@ ws_user_url = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 chain_id = 137
 
 [trading]
-enabled = false      # Start in paper mode — set to true for live
-paper_mode = true    # Log orders without sending to CLOB
+enabled = true       # Enable trading
+paper_mode = false   # LIVE: send real orders to CLOB
 
 [strategy]
 min_half_spread = 0.01         # Minimum half-spread (1 cent)
@@ -45,8 +45,9 @@ trigger_seconds_before_close = 10.0
 min_seconds_before_close = 2.0
 
 [arb]
-monitor_only = true            # Phase 0: just log/alert, don't trade
+monitor_only = false           # LIVE: place arb orders when edge detected
 min_alert_edge_cents = 0.005   # Alert when edge > 0.5 cents per share
+order_size_usd = 0.50          # $0.50 per side = ~$1.00 total per market
 
 [feeds]
 binance_ws_url = "wss://stream.binance.com:9443/ws"
