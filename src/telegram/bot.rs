@@ -4,7 +4,6 @@
 //! Also broadcasts event alerts (fills, circuit breaker, etc).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -23,7 +22,6 @@ pub struct TelegramState {
     pub feed_hub: Arc<FeedHub>,
     pub discovery: Arc<GammaDiscovery>,
     pub risk_manager: Arc<RiskManager>,
-    pub paused: Arc<AtomicBool>,
 }
 
 /// Telegram notification + command bot with inline keyboard.
@@ -153,11 +151,18 @@ impl TelegramBot {
                 (self.txt_pnl(), back_keyboard())
             }
             "pause" | "/pause" => {
-                self.state.paused.store(true, Ordering::SeqCst);
-                ("⏸ <b>Quoting paused</b>\nAll new orders halted.".to_string(), pause_resume_keyboard(true))
+                self.state.risk_manager.set_paused(true);
+                // Also cancel all live orders immediately
+                let om = self.state.order_manager.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = om.cancel_all().await {
+                        tracing::error!(error = %e, "failed to cancel orders on pause");
+                    }
+                });
+                ("⏸ <b>Quoting paused</b>\nAll new orders cancelled. No new orders will be placed.".to_string(), pause_resume_keyboard(true))
             }
             "resume" | "/resume" => {
-                self.state.paused.store(false, Ordering::SeqCst);
+                self.state.risk_manager.set_paused(false);
                 ("▶️ <b>Quoting resumed</b>".to_string(), pause_resume_keyboard(false))
             }
             "feeds" | "/feeds" => {
@@ -173,7 +178,7 @@ impl TelegramBot {
         let feed_status = self.state.feed_hub.feed_status();
         let tracked = self.state.discovery.tracked.len();
         let orders = self.state.order_manager.live_order_count();
-        let paused = self.state.paused.load(Ordering::SeqCst);
+        let paused = self.state.risk_manager.is_paused();
 
         format!(
             "🤖 <b>Polymarket Maker Bot</b>\n\n\
@@ -193,7 +198,6 @@ impl TelegramBot {
         let positions = self.state.position_tracker.position_count();
         let exposure = self.state.position_tracker.get_total_exposure_usd();
         let tracked_markets = self.state.discovery.tracked.len();
-        let paused = self.state.paused.load(Ordering::SeqCst);
         let risk = self.state.risk_manager.state();
 
         format!(
@@ -208,7 +212,7 @@ impl TelegramBot {
             <b>Feeds</b>\n\
             Binance: {} (age: {:.0}ms)\n\
             Coinbase: {} (age: {:.0}ms)",
-            if paused { "⏸ PAUSED" } else { "▶️ RUNNING" },
+            if risk.paused { "⏸ PAUSED" } else { "▶️ RUNNING" },
             tracked_markets,
             live_orders,
             positions,

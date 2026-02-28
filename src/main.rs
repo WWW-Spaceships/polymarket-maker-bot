@@ -178,7 +178,6 @@ async fn main() {
             feed_hub: feed_hub.clone(),
             discovery: discovery.clone(),
             risk_manager: risk_manager.clone(),
-            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         let tg = telegram::bot::TelegramBot::new(
             config.telegram.clone(),

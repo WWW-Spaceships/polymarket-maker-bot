@@ -55,7 +55,7 @@ pub async fn run_cancel_replace_loop(
     feed_hub: Arc<FeedHub>,
     strategy_engine: Arc<StrategyEngine>,
     order_manager: Arc<OrderManager>,
-    _risk_manager: Arc<RiskManager>,
+    risk_manager: Arc<RiskManager>,
     position_tracker: Arc<PositionTracker>,
     event_bus: Arc<EventBus>,
     config: Arc<Config>,
@@ -93,6 +93,22 @@ pub async fn run_cancel_replace_loop(
                 break;
             }
             _ => {}
+        }
+
+        // 1b. If paused or halted, cancel all orders and skip cycle
+        if risk_manager.is_halted() {
+            let cid = ctx.condition_id.clone();
+            drop(ctx);
+            let _ = order_manager
+                .cancel_market_orders(&cid, config.trading.paper_mode)
+                .await;
+            let elapsed = cycle_start.elapsed();
+            if elapsed < cycle_interval {
+                time::sleep(cycle_interval - elapsed).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+            continue;
         }
 
         // 2. Get oracle snapshot for this market's asset

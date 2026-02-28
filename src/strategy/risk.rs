@@ -15,12 +15,15 @@ pub struct RiskState {
     pub daily_pnl: f64,
     pub active_markets: usize,
     pub halted: bool,
+    pub paused: bool,
 }
 
 /// Risk manager enforcing position limits and circuit breakers.
 pub struct RiskManager {
     config: RiskConfig,
     halted: AtomicBool,
+    /// Manual pause via Telegram button — distinct from circuit breaker.
+    paused: AtomicBool,
     daily_pnl: RwLock<f64>,
     total_exposure: RwLock<f64>,
     active_market_count: RwLock<usize>,
@@ -32,6 +35,7 @@ impl RiskManager {
         Self {
             config,
             halted: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
             daily_pnl: RwLock::new(0.0),
             total_exposure: RwLock::new(0.0),
             active_market_count: RwLock::new(0),
@@ -144,9 +148,19 @@ impl RiskManager {
         *self.active_market_count.write() = count;
     }
 
-    /// Check if trading is halted.
+    /// Check if trading is halted (circuit breaker OR manual pause).
     pub fn is_halted(&self) -> bool {
-        self.halted.load(Ordering::Relaxed)
+        self.halted.load(Ordering::Relaxed) || self.paused.load(Ordering::Relaxed)
+    }
+
+    /// Manual pause/resume via Telegram.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::SeqCst);
+    }
+
+    /// Check if manually paused (for status display).
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
     }
 
     /// Get current risk state snapshot.
@@ -155,7 +169,8 @@ impl RiskManager {
             total_exposure_usd: *self.total_exposure.read(),
             daily_pnl: *self.daily_pnl.read(),
             active_markets: *self.active_market_count.read(),
-            halted: self.is_halted(),
+            halted: self.halted.load(Ordering::Relaxed),
+            paused: self.paused.load(Ordering::Relaxed),
         }
     }
 
